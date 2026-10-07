@@ -12,6 +12,7 @@ import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.http.MediaType;
 import org.springframework.stereotype.Component;
 import org.springframework.web.servlet.HandlerInterceptor;
@@ -37,7 +38,7 @@ public class AuthInterceptor implements HandlerInterceptor {
     private final RateLimiter rateLimiter;
 
     public AuthInterceptor(TokenService tokenService, AuthorizationService authorizationService,
-                           RateLimiter rateLimiter) {
+                           @Qualifier("apiRateLimiter") RateLimiter rateLimiter) {
         this.tokenService = tokenService;
         this.authorizationService = authorizationService;
         this.rateLimiter = rateLimiter;

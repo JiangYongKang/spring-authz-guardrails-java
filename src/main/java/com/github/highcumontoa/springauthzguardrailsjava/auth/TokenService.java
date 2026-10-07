@@ -26,7 +26,9 @@ import java.util.concurrent.ConcurrentHashMap;
  *
  * 失效机制：
  *  - 单令牌撤销：jti 进入撤销集合；
- *  - 主体级撤销（注销）：记录主体撤销时间戳，凡 iat 早于该时刻的令牌一律失效。
+ *  - 主体级撤销（注销）：主体持有单调递增的“注销代号”，令牌 payload 的 rvv 声明记录签发时代号，
+ *    代号不匹配当前值即失效。代号只增不减，因此注销后立刻重新登录也不会把旧令牌“复活”，
+ *    且同一秒内完成注销+重新登录不会误伤新令牌（不依赖秒级时间戳）。
  */
 @Service
 public class TokenService {
@@ -40,8 +42,8 @@ public class TokenService {
 
     /** 已撤销的令牌编号 */
     private final Set<String> revokedJti = ConcurrentHashMap.newKeySet();
-    /** 主体 -> 撤销时间戳（epoch 秒），iat 早于等于该值的令牌全部失效 */
-    private final Map<String, Long> subjectRevokedAt = new ConcurrentHashMap<>();
+    /** 主体 -> 当前注销代号，rvv 不等于该值的令牌全部失效；代号单调递增 */
+    private final Map<String, Long> subjectGeneration = new ConcurrentHashMap<>();
 
     @org.springframework.beans.factory.annotation.Autowired
     public TokenService(@Value("${security.token.ttl-seconds:300}") long ttlSeconds, Clock clock) {
@@ -59,7 +61,17 @@ public class TokenService {
         this.clock = clock;
     }
 
+    /** 主体当前注销代号（从未注销或未登录过为 0）。 */
+    public long currentGeneration(String subject) {
+        return subjectGeneration.getOrDefault(subject, 0L);
+    }
+
     public String issueToken(String subject, Set<String> permissions) {
+        return issueToken(subject, permissions, currentGeneration(subject));
+    }
+
+    /** 签发携带指定注销代号的访问令牌（登录/续期换发时使用）。 */
+    public String issueToken(String subject, Set<String> permissions, long generation) {
         long now = clock.instant().getEpochSecond();
         String header = "{\"alg\":\"HS256\",\"typ\":\"JWT\"}";
         String payload = "{"
@@ -67,6 +79,7 @@ public class TokenService {
                 + "\"perms\":\"" + escape(String.join(",", permissions)) + "\","
                 + "\"iat\":" + now + ","
                 + "\"exp\":" + (now + ttlSeconds) + ","
+                + "\"rvv\":" + generation + ","
                 + "\"jti\":\"" + UUID.randomUUID() + "\""
                 + "}";
         String unsigned = B64.encodeToString(header.getBytes(StandardCharsets.UTF_8))
@@ -111,9 +124,9 @@ public class TokenService {
         if (revokedJti.contains(jti)) {
             return AuthResult.fail(AuthFailureReason.TOKEN_REVOKED);
         }
-        Long revokedAt = subjectRevokedAt.get(subject);
-        long iat = parseLong(claims.get("iat"), -1);
-        if (revokedAt != null && iat <= revokedAt) {
+        // 无 rvv 声明的旧令牌视为第 0 代；与当前代号不一致即已被注销作废
+        long tokenGeneration = parseLong(claims.get("rvv"), 0);
+        if (tokenGeneration != subjectGeneration.getOrDefault(subject, 0L)) {
             return AuthResult.fail(AuthFailureReason.TOKEN_REVOKED);
         }
         long exp = parseLong(claims.get("exp"), -1);
@@ -143,9 +156,9 @@ public class TokenService {
         }
     }
 
-    /** 注销：使该主体此前签发的所有令牌立即失效。 */
+    /** 注销：注销代号前进一步，使该主体此前签发的所有令牌立即失效；代号不回退。 */
     public void revokeAllForSubject(String subject) {
-        subjectRevokedAt.merge(subject, clock.instant().getEpochSecond(), Math::max);
+        subjectGeneration.merge(subject, 1L, Math::addExact);
     }
 
     private byte[] sign(String unsigned) {

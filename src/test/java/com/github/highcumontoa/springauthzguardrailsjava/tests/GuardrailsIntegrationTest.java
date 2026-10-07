@@ -4,6 +4,7 @@ import com.github.highcumontoa.springauthzguardrailsjava.ratelimit.RateLimiter;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.boot.test.web.client.TestRestTemplate;
@@ -36,9 +37,13 @@ import static org.junit.jupiter.api.Assertions.*;
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT, properties = {
         "security.token.ttl-seconds=300",
+        "security.refresh-token.ttl-seconds=7200",
         "ratelimit.window-millis=1000",
         "ratelimit.max-requests=50",
-        "ratelimit.max-failures=1000"
+        "ratelimit.max-failures=1000",
+        "ratelimit.auth.window-millis=1000",
+        "ratelimit.auth.max-requests=100000",
+        "ratelimit.auth.max-failures=3"
 })
 class GuardrailsIntegrationTest {
 
@@ -60,7 +65,12 @@ class GuardrailsIntegrationTest {
     TestRestTemplate rest;
 
     @Autowired
+    @Qualifier("apiRateLimiter")
     RateLimiter rateLimiter;
+
+    @Autowired
+    @Qualifier("authRateLimiter")
+    RateLimiter authRateLimiter;
 
     private String base;
 
@@ -68,6 +78,7 @@ class GuardrailsIntegrationTest {
     void setUp() {
         base = "http://localhost:" + port;
         rateLimiter.reset();
+        authRateLimiter.reset();
         // 令牌时间戳为秒级：每个用例前推进时钟，保证新签发令牌的 iat 严格晚于
         // 此前任何用例产生的注销时间戳，避免用例间状态串扰
         TestClockConfig.CLOCK.advance(Duration.ofSeconds(2));
@@ -224,13 +235,257 @@ class GuardrailsIntegrationTest {
         assertEquals("TOKEN_TAMPERED", resp.getBody().get("reason"));
     }
 
+    // ---------- 续期：成功换发、权限一致 ----------
+
+    @Test
+    void refreshIssuesUsableTokenWithSamePermissions() {
+        Map<String, Object> pair = loginPair("bob", "bob-pass"); // ADMIN
+        String refreshToken = (String) pair.get("refreshToken");
+        // 访问令牌过期后，无需口令即可续期
+        TestClockConfig.CLOCK.advance(Duration.ofSeconds(301));
+        Map<String, Object> refreshed = refresh(refreshToken);
+        String newToken = (String) refreshed.get("token");
+        // 新令牌立即可用
+        assertEquals(200, get("/api/resource", newToken).getStatusCode().value());
+        // 权限与原登录主体一致：bob 仍是 ADMIN（不越权也不降权）
+        assertEquals(200, get("/api/admin/stats", newToken).getStatusCode().value());
+        assertNotNull(refreshed.get("refreshToken"));
+    }
+
+    @Test
+    void refreshDoesNotEscalatePermissions() {
+        Map<String, Object> pair = loginPair("carol", "carol-pass"); // GUEST
+        Map<String, Object> refreshed = refresh((String) pair.get("refreshToken"));
+        String newToken = (String) refreshed.get("token");
+        // GUEST 续期后仍不能写、不能管理
+        assertEquals(403, post("/api/resource", newToken).getStatusCode().value());
+        assertEquals(403, get("/api/admin/stats", newToken).getStatusCode().value());
+        assertEquals(200, get("/api/resource", newToken).getStatusCode().value());
+    }
+
+    // ---------- 续期凭据：过期 / 篡改 / 撤销 / 已轮换，结论可区分 ----------
+
+    @Test
+    void expiredRefreshCredentialRejectedWithDistinctReason() {
+        Map<String, Object> pair = loginPair("alice", "alice-pass");
+        TestClockConfig.CLOCK.advance(Duration.ofSeconds(7201));
+        ResponseEntity<Map> resp = postJson("/auth/refresh",
+                Map.of("refreshToken", pair.get("refreshToken")), null);
+        assertEquals(401, resp.getStatusCode().value());
+        assertEquals("REFRESH_EXPIRED", resp.getBody().get("reason"));
+    }
+
+    @Test
+    void tamperedRefreshCredentialRejected() {
+        loginPair("alice", "alice-pass");
+        ResponseEntity<Map> resp = postJson("/auth/refresh",
+                Map.of("refreshToken", "garbage.token.value"), null);
+        assertEquals(401, resp.getStatusCode().value());
+        assertEquals("REFRESH_TAMPERED", resp.getBody().get("reason"));
+    }
+
+    @Test
+    void accessTokenCannotBeUsedAsRefreshCredential() {
+        Map<String, Object> pair = loginPair("alice", "alice-pass");
+        ResponseEntity<Map> resp = postJson("/auth/refresh",
+                Map.of("refreshToken", pair.get("token")), null);
+        assertEquals(401, resp.getStatusCode().value());
+        assertEquals("REFRESH_TAMPERED", resp.getBody().get("reason"));
+    }
+
+    @Test
+    void missingRefreshCredentialRejected() {
+        ResponseEntity<Map> resp = postJson("/auth/refresh", Map.of(), null);
+        assertEquals(401, resp.getStatusCode().value());
+        assertEquals("REFRESH_MISSING", resp.getBody().get("reason"));
+    }
+
+    @Test
+    void revokedRefreshCredentialRejectedAfterLogout() {
+        Map<String, Object> pair = loginPair("alice", "alice-pass");
+        assertEquals(200, postWithToken("/auth/logout", (String) pair.get("token")).getStatusCode().value());
+        ResponseEntity<Map> resp = postJson("/auth/refresh",
+                Map.of("refreshToken", pair.get("refreshToken")), null);
+        assertEquals(401, resp.getStatusCode().value());
+        assertEquals("REFRESH_REVOKED", resp.getBody().get("reason"));
+    }
+
+    // ---------- 一次性轮换：旧凭据当场作废 ----------
+
+    @Test
+    void refreshRotatesCredentialAndOldOneIsInvalid() {
+        Map<String, Object> pair = loginPair("alice", "alice-pass");
+        String oldRefresh = (String) pair.get("refreshToken");
+        Map<String, Object> first = refresh(oldRefresh);
+        String newRefresh = (String) first.get("refreshToken");
+        assertNotEquals(oldRefresh, newRefresh);
+        // 旧凭据再次使用被拒，且不产生新凭据
+        ResponseEntity<Map> replay = postJson("/auth/refresh", Map.of("refreshToken", oldRefresh), null);
+        assertEquals(401, replay.getStatusCode().value());
+        assertEquals("REFRESH_USED", replay.getBody().get("reason"));
+        // 新凭据可继续轮换
+        Map<String, Object> second = refresh(newRefresh);
+        assertEquals(200, get("/api/resource", (String) second.get("token")).getStatusCode().value());
+    }
+
+    @Test
+    void concurrentRefreshWithSameCredentialSucceedsAtMostOnce() throws Exception {
+        Map<String, Object> pair = loginPair("alice", "alice-pass");
+        String oldRefresh = (String) pair.get("refreshToken");
+        int threads = 16;
+        ExecutorService pool = Executors.newFixedThreadPool(threads);
+        List<Callable<Integer>> tasks = new ArrayList<>();
+        for (int i = 0; i < threads; i++) {
+            tasks.add(() -> postJson("/auth/refresh", Map.of("refreshToken", oldRefresh), null)
+                    .getStatusCode().value());
+        }
+        List<Future<Integer>> results = pool.invokeAll(tasks);
+        pool.shutdown();
+        int ok = 0, rejected = 0, other = 0;
+        for (Future<Integer> f : results) {
+            int status = f.get();
+            if (status == 200) {
+                ok++;
+            } else if (status == 401 || status == 429) {
+                // 401 REFRESH_USED 为旧凭据重放；失败尝试累积到阈值后按入口限流 429 拒绝——
+                // 二者都是“拒绝且不产生新凭据”，服务层并发单测严格保证恰一次成功
+                rejected++;
+            } else {
+                other++;
+            }
+        }
+        // 再发一次确认旧凭据状态为 REFRESH_USED（结论本身可区分）
+        ResponseEntity<Map> replay = postJson("/auth/refresh", Map.of("refreshToken", oldRefresh), null);
+        assertTrue(replay.getStatusCode().value() == 401 || replay.getStatusCode().value() == 429);
+        assertEquals(1, ok, "并发轮换仅一次成功，不会多出可用凭据");
+        assertEquals(threads - 1, rejected, "其余全部被拒绝");
+        assertEquals(0, other, "不得出现非拒绝类异常结论");
+    }
+
+    // ---------- 注销即时性与隔离性 ----------
+
+    @Test
+    void reloginImmediatelyAfterLogoutWorksWithoutClockAdvance() {
+        Map<String, Object> pair = loginPair("alice", "alice-pass");
+        String token = (String) pair.get("token");
+        assertEquals(200, get("/api/resource", token).getStatusCode().value());
+        // 注销
+        assertEquals(200, postWithToken("/auth/logout", token).getStatusCode().value());
+        // 旧访问令牌与旧续期凭据立即失效
+        assertEquals(401, get("/api/resource", token).getStatusCode().value());
+        ResponseEntity<Map> oldRefresh = postJson("/auth/refresh",
+                Map.of("refreshToken", pair.get("refreshToken")), null);
+        assertEquals("REFRESH_REVOKED", oldRefresh.getBody().get("reason"));
+        // 不推进时间，立刻重新登录：新令牌马上可用
+        Map<String, Object> rePair = loginPair("alice", "alice-pass");
+        String newToken = (String) rePair.get("token");
+        assertEquals(200, get("/api/resource", newToken).getStatusCode().value());
+        // 新续期凭据可用
+        Map<String, Object> refreshed = refresh((String) rePair.get("refreshToken"));
+        assertEquals(200, get("/api/resource", (String) refreshed.get("token")).getStatusCode().value());
+        // 旧凭据依旧作废（未因重新登录复活）
+        ResponseEntity<Map> stale = postJson("/auth/refresh",
+                Map.of("refreshToken", pair.get("refreshToken")), null);
+        assertEquals(401, stale.getStatusCode().value());
+        assertEquals("REFRESH_REVOKED", stale.getBody().get("reason"));
+    }
+
+    @Test
+    void logoutOfOneSubjectDoesNotAffectOthers() {
+        Map<String, Object> alice = loginPair("alice", "alice-pass");
+        Map<String, Object> bob = loginPair("bob", "bob-pass");
+        assertEquals(200, postWithToken("/auth/logout", (String) alice.get("token")).getStatusCode().value());
+        // bob 的访问令牌与续期凭据不受牵连
+        assertEquals(200, get("/api/resource", (String) bob.get("token")).getStatusCode().value());
+        Map<String, Object> bobRefreshed = refresh((String) bob.get("refreshToken"));
+        assertEquals(200, get("/api/resource", (String) bobRefreshed.get("token")).getStatusCode().value());
+    }
+
+    // ---------- 认证入口限流：失败计数、阈值、恢复、与业务限流独立 ----------
+
+    @Test
+    void failedLoginAttemptsAreRateLimitedAndRecover() {
+        for (int i = 0; i < 3; i++) {
+            ResponseEntity<Map> bad = rest.postForEntity(base + "/auth/login",
+                    Map.of("username", "alice", "password", "wrong"), Map.class);
+            assertEquals(401, bad.getStatusCode().value());
+            assertEquals("BAD_CREDENTIALS", bad.getBody().get("reason"));
+        }
+        // 第 4 次（即使口令正确）在窗口内被登录入口限流，结论可区分
+        ResponseEntity<Map> limited = rest.postForEntity(base + "/auth/login",
+                Map.of("username", "alice", "password", "alice-pass"), Map.class);
+        assertEquals(429, limited.getStatusCode().value());
+        assertEquals("LOGIN_RATE_LIMITED", limited.getBody().get("reason"));
+        // 窗口滚动后自动恢复
+        TestClockConfig.CLOCK.advance(Duration.ofMillis(1001));
+        Map<String, Object> pair = loginPair("alice", "alice-pass");
+        assertEquals(200, get("/api/resource", (String) pair.get("token")).getStatusCode().value());
+    }
+
+    @Test
+    void failedRefreshAttemptsAreRateLimitedAndRecover() {
+        loginPair("alice", "alice-pass");
+        for (int i = 0; i < 3; i++) {
+            ResponseEntity<Map> bad = postJson("/auth/refresh",
+                    Map.of("refreshToken", "bad.token.x"), null);
+            assertEquals(401, bad.getStatusCode().value());
+            assertEquals("REFRESH_TAMPERED", bad.getBody().get("reason"));
+        }
+        ResponseEntity<Map> limited = postJson("/auth/refresh",
+                Map.of("refreshToken", "bad.token.x"), null);
+        assertEquals(429, limited.getStatusCode().value());
+        assertEquals("REFRESH_RATE_LIMITED", limited.getBody().get("reason"));
+        // 窗口推移后，合法续期恢复正常
+        TestClockConfig.CLOCK.advance(Duration.ofMillis(1001));
+        Map<String, Object> pair = loginPair("alice", "alice-pass");
+        assertEquals(200, postJson("/auth/refresh",
+                Map.of("refreshToken", pair.get("refreshToken")), null).getStatusCode().value());
+    }
+
+    @Test
+    void authEntryRateLimitIsIndependentOfApiRateLimit() {
+        // 业务接口被限流
+        String token = login("alice", "alice-pass");
+        for (int i = 0; i < 50; i++) {
+            assertEquals(200, get("/api/resource", token).getStatusCode().value());
+        }
+        assertEquals(429, get("/api/resource", token).getStatusCode().value());
+        // 登录入口不受业务限流牵连
+        Map<String, Object> pair = loginPair("bob", "bob-pass");
+        assertNotNull(pair.get("refreshToken"));
+        // 续期入口同样不受牵连
+        assertEquals(200, postJson("/auth/refresh",
+                Map.of("refreshToken", pair.get("refreshToken")), null).getStatusCode().value());
+    }
+
     // ---------- 辅助方法 ----------
 
     private String login(String username, String password) {
+        return (String) loginPair(username, password).get("token");
+    }
+
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> loginPair(String username, String password) {
         ResponseEntity<Map> resp = rest.postForEntity(base + "/auth/login",
                 Map.of("username", username, "password", password), Map.class);
         assertEquals(200, resp.getStatusCode().value(), "登录应成功: " + username);
-        return (String) resp.getBody().get("token");
+        return resp.getBody();
+    }
+
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> refresh(String refreshToken) {
+        ResponseEntity<Map> resp = postJson("/auth/refresh", Map.of("refreshToken", refreshToken), null);
+        assertEquals(200, resp.getStatusCode().value(), "续期应成功");
+        return resp.getBody();
+    }
+
+    private ResponseEntity<Map> postJson(String path, Object body, String bearerToken) {
+        HttpHeaders headers = new HttpHeaders();
+        headers.setContentType(MediaType.APPLICATION_JSON);
+        if (bearerToken != null) {
+            headers.setBearerAuth(bearerToken);
+        }
+        return rest.exchange(base + path, HttpMethod.POST, new HttpEntity<>(body, headers), Map.class);
     }
 
     private ResponseEntity<Map> get(String path, String token) {

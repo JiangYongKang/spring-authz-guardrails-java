@@ -113,4 +113,21 @@ class TokenServiceTest {
         assertFalse(tokenService.validate(alice).success());
         assertTrue(tokenService.validate(bob).success());
     }
+
+    @Test
+    void reloginWithinSameSecondKeepsOldTokenRevokedAndNewTokenValid() {
+        String oldToken = tokenService.issueToken("alice", Set.of());
+        // 注销与重新登录发生在同一秒：代号方案不应误伤新令牌，也不应复活旧令牌
+        tokenService.revokeAllForSubject("alice");
+        long gen = tokenService.currentGeneration("alice");
+        assertEquals(1L, gen);
+        String newToken = tokenService.issueToken("alice", Set.of(), gen);
+        assertEquals(AuthFailureReason.TOKEN_REVOKED, tokenService.validate(oldToken).failureReason());
+        assertTrue(tokenService.validate(newToken).success());
+        // 再次注销，前一代令牌作废
+        tokenService.revokeAllForSubject("alice");
+        assertEquals(AuthFailureReason.TOKEN_REVOKED, tokenService.validate(newToken).failureReason());
+        String third = tokenService.issueToken("alice", Set.of(), tokenService.currentGeneration("alice"));
+        assertTrue(tokenService.validate(third).success());
+    }
 }

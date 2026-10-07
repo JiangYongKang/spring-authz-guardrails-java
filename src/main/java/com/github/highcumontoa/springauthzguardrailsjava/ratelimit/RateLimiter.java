@@ -1,7 +1,6 @@
 package com.github.highcumontoa.springauthzguardrailsjava.ratelimit;
 
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.stereotype.Component;
 
 import java.time.Clock;
 import java.util.Map;
@@ -14,8 +13,10 @@ import java.util.concurrent.ConcurrentHashMap;
  * 失败尝试（认证/授权失败）单独计数，超过 maxFailures 同样触发限制。
  * 窗口随时间推移自动滚动，计数清零即自动恢复。
  * 线程安全：所有状态变更通过 ConcurrentHashMap.compute 原子完成。
+ *
+ * Bean 由 {@code AppConfig} 声明：业务接口（apiRateLimiter）与认证入口
+ * （authRateLimiter：登录/续期）使用相互独立的两个实例，互不牵连。
  */
-@Component
 public class RateLimiter {
 
     private final long windowMillis;
@@ -47,7 +48,8 @@ public class RateLimiter {
             s.requests++;
             return s;
         });
-        if (state.requests > maxRequests || state.failures > maxFailures) {
+        // 计数“达到”阈值的下一次调用即拒绝：失败数达到上限时，随后的尝试直接被限流
+        if (state.requests > maxRequests || state.failures >= maxFailures) {
             return RateLimitDecision.rejected(state.retryAfterMillis(now, windowMillis));
         }
         return RateLimitDecision.allowed(maxRequests - state.requests);
@@ -66,6 +68,11 @@ public class RateLimiter {
     /** 清空全部统计（测试辅助）。 */
     public void reset() {
         states.clear();
+    }
+
+    /** 清空单个主体的统计（成功登录/续期后立即恢复，不再受此前失败计数牵连）。 */
+    public void reset(String subjectKey) {
+        states.remove(subjectKey);
     }
 
     /** 单个主体的窗口状态。仅在 map.compute 原子区间内被修改，无需额外同步。 */
