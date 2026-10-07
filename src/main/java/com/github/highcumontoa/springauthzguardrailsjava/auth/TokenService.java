@@ -26,7 +26,8 @@ import java.util.concurrent.ConcurrentHashMap;
  *
  * 失效机制：
  *  - 单令牌撤销：jti 进入撤销集合；
- *  - 主体级撤销（注销）：记录主体撤销时间戳，凡 iat 早于该时刻的令牌一律失效。
+ *  - 主体级撤销（注销）：主体纪元号（epoch）单调递增，令牌携带签发时纪元，
+ *    纪元不匹配即失效——注销后立刻重新登录签发的新令牌使用新纪元，可立即使用。
  */
 @Service
 public class TokenService {
@@ -40,8 +41,8 @@ public class TokenService {
 
     /** 已撤销的令牌编号 */
     private final Set<String> revokedJti = ConcurrentHashMap.newKeySet();
-    /** 主体 -> 撤销时间戳（epoch 秒），iat 早于等于该值的令牌全部失效 */
-    private final Map<String, Long> subjectRevokedAt = new ConcurrentHashMap<>();
+    /** 主体 -> 当前纪元号，注销即递增；令牌纪元与之不匹配即失效 */
+    private final Map<String, java.util.concurrent.atomic.AtomicLong> subjectEpoch = new ConcurrentHashMap<>();
 
     @org.springframework.beans.factory.annotation.Autowired
     public TokenService(@Value("${security.token.ttl-seconds:300}") long ttlSeconds, Clock clock) {
@@ -67,7 +68,8 @@ public class TokenService {
                 + "\"perms\":\"" + escape(String.join(",", permissions)) + "\","
                 + "\"iat\":" + now + ","
                 + "\"exp\":" + (now + ttlSeconds) + ","
-                + "\"jti\":\"" + UUID.randomUUID() + "\""
+                + "\"jti\":\"" + UUID.randomUUID() + "\","
+                + "\"se\":" + currentEpoch(subject)
                 + "}";
         String unsigned = B64.encodeToString(header.getBytes(StandardCharsets.UTF_8))
                 + "." + B64.encodeToString(payload.getBytes(StandardCharsets.UTF_8));
@@ -111,9 +113,8 @@ public class TokenService {
         if (revokedJti.contains(jti)) {
             return AuthResult.fail(AuthFailureReason.TOKEN_REVOKED);
         }
-        Long revokedAt = subjectRevokedAt.get(subject);
-        long iat = parseLong(claims.get("iat"), -1);
-        if (revokedAt != null && iat <= revokedAt) {
+        long se = parseLong(claims.get("se"), -1);
+        if (se < 0 || se != currentEpoch(subject)) {
             return AuthResult.fail(AuthFailureReason.TOKEN_REVOKED);
         }
         long exp = parseLong(claims.get("exp"), -1);
@@ -143,9 +144,15 @@ public class TokenService {
         }
     }
 
-    /** 注销：使该主体此前签发的所有令牌立即失效。 */
+    /** 注销：递增主体纪元，此前签发的所有令牌立即失效且不可复效。 */
     public void revokeAllForSubject(String subject) {
-        subjectRevokedAt.merge(subject, clock.instant().getEpochSecond(), Math::max);
+        subjectEpoch.computeIfAbsent(subject, k -> new java.util.concurrent.atomic.AtomicLong())
+                .incrementAndGet();
+    }
+
+    private long currentEpoch(String subject) {
+        var epoch = subjectEpoch.get(subject);
+        return epoch == null ? 0 : epoch.get();
     }
 
     private byte[] sign(String unsigned) {

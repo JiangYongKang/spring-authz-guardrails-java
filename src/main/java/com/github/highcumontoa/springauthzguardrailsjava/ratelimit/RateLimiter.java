@@ -16,6 +16,7 @@ import java.util.concurrent.ConcurrentHashMap;
  * 线程安全：所有状态变更通过 ConcurrentHashMap.compute 原子完成。
  */
 @Component
+@org.springframework.context.annotation.Primary
 public class RateLimiter {
 
     private final long windowMillis;

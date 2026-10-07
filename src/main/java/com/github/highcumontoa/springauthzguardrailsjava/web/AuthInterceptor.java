@@ -119,6 +119,10 @@ public class AuthInterceptor implements HandlerInterceptor {
             case TOKEN_TAMPERED -> "令牌格式非法或签名不匹配（疑似被篡改）";
             case TOKEN_EXPIRED -> "令牌已过期";
             case TOKEN_REVOKED -> "令牌已被撤销（注销或主动失效）";
+            case REFRESH_TOKEN_MISSING -> "未提供续期凭据";
+            case REFRESH_TOKEN_TAMPERED -> "续期凭据格式非法或签名不匹配（疑似被篡改）";
+            case REFRESH_TOKEN_EXPIRED -> "续期凭据已过期";
+            case REFRESH_TOKEN_REVOKED -> "续期凭据已被撤销（注销、已轮换作废或被重复使用）";
         };
     }
 
